@@ -1,0 +1,200 @@
+name: Resign IPA and Distribute via OTA
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Releaseのタグ名（例: v1.0.0）'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write  # Release作成・アセットアップロードに必要
+
+jobs:
+  resign-and-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 1. リポジトリ内の証明書とプロファイルをキーチェーンにインポート
+      # ------------------------------------------------------------
+      - name: Import certificate and provisioning profile
+        run: |
+          CERTIFICATE_PATH="./Beijing Zhizhangyi Inc..p12"
+          PROFILE_PATH="./Beijing Zhizhangyi Inc..mobileprovision"
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          
+          # パスワードをファイルから取得（改行を除去）
+          P12_PASSWORD=$(cat ./password.txt | tr -d '\n\r')
+          
+          # キーチェーン用のランダムパスワードを生成
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # 一時キーチェーンを作成
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # 証明書をインポート
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # プロビジョニングプロファイルを配置
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+          
+          # 署名IDを自動取得して環境変数に保存
+          SIGNING_IDENTITY=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep "Apple Distribution\|iPhone Distribution" | head -1 | awk -F '"' '{print $2}')
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
+          echo "PROFILE_PATH=$PROFILE_PATH" >> $GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # 2. ipas/Gopeed.txt からURLを読み取り、IPAをダウンロード
+      # ------------------------------------------------------------
+      - name: Download IPA from URL
+        run: |
+          IPA_URL=$(cat ipas/Gopeed.txt | tr -d '\n\r')
+          echo "Downloading IPA from: $IPA_URL"
+          curl -L -o ./app.ipa "$IPA_URL"
+
+      # ------------------------------------------------------------
+      # 3. Ruby / fastlane のセットアップ
+      # ------------------------------------------------------------
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+
+      - name: Install fastlane
+        run: gem install fastlane
+
+      # ------------------------------------------------------------
+      # 4. Fastlane resign の実行
+      # ------------------------------------------------------------
+      - name: Resign IPA with fastlane
+        run: |
+          fastlane run resign \
+            ipa:"./app.ipa" \
+            signing_identity:"${{ env.SIGNING_IDENTITY }}" \
+            provisioning_profile:"${{ env.PROFILE_PATH }}"
+
+      # ------------------------------------------------------------
+      # 5. 再署名されたIPAの特定とアプリ情報の取得
+      # ------------------------------------------------------------
+      - name: Locate resigned IPA and extract app info
+        id: app_info
+        run: |
+          RESIGNED_IPA="./app-resigned.ipa"
+          # ファイルが見つからない場合のフォールバック
+          if [ ! -f "$RESIGNED_IPA" ]; then
+            RESIGNED_IPA=$(find . -name "*-resigned.ipa" | head -n 1)
+          fi
+
+          if [ -z "$RESIGNED_IPA" ]; then
+            echo "Resigned IPA not found." >&2
+            exit 1
+          fi
+          
+          echo "ipa_path=$RESIGNED_IPA" >> "$GITHUB_OUTPUT"
+          echo "ipa_filename=$(basename "$RESIGNED_IPA")" >> "$GITHUB_OUTPUT"
+
+          # Info.plist から Bundle ID / バージョン / 表示名を取得
+          APP_DIR=$(mktemp -d)
+          unzip -q "$RESIGNED_IPA" -d "$APP_DIR"
+          PLIST="$APP_DIR/Payload/"*.app/Info.plist
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")
+          BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST")
+          APP_TITLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$PLIST")
+
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          echo "bundle_version=$BUNDLE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_title=$APP_TITLE" >> "$GITHUB_OUTPUT"
+
+          rm -rf "$APP_DIR"
+
+      # ------------------------------------------------------------
+      # 6. manifest.plist の生成（IPA URL はプレースホルダー）
+      # ------------------------------------------------------------
+      - name: Generate manifest.plist
+        run: |
+          cat > manifest.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>items</key>
+            <array>
+              <dict>
+                <key>assets</key>
+                <array>
+                  <dict>
+                    <key>kind</key>
+                    <string>software-package</string>
+                    <key>url</key>
+                    <string>IPA_URL_PLACEHOLDER</string>
+                  </dict>
+                </array>
+                <key>metadata</key>
+                <dict>
+                  <key>bundle-identifier</key>
+                  <string>${{ steps.app_info.outputs.bundle_id }}</string>
+                  <key>bundle-version</key>
+                  <string>${{ steps.app_info.outputs.bundle_version }}</string>
+                  <key>kind</key>
+                  <string>software</string>
+                  <key>title</key>
+                  <string>${{ steps.app_info.outputs.app_title }}</string>
+                </dict>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          EOF
+
+      # ------------------------------------------------------------
+      # 7. Release に IPA と manifest.plist をアップロード（初回）
+      # ------------------------------------------------------------
+      - name: Upload IPA and manifest to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          files: |
+            ${{ steps.app_info.outputs.ipa_path }}
+            manifest.plist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------
+      # 8. manifest.plist 内の IPA URL を実際のRelease URLに置換して再アップロード
+      # ------------------------------------------------------------
+      - name: Fix IPA URL in manifest.plist
+        run: |
+          IPA_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/${{ steps.app_info.outputs.ipa_filename }}"
+          sed -i '' "s|IPA_URL_PLACEHOLDER|${IPA_URL}|" manifest.plist
+
+      - name: Re-upload updated manifest.plist
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          files: manifest.plist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------
+      # 9. OTAインストールリンクをWorkflowサマリーに出力
+      # ------------------------------------------------------------
+      - name: Output OTA install link
+        run: |
+          MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/manifest.plist"
+          INSTALL_URL="itms-services://?action=download-manifest&url=${MANIFEST_URL}"
+          echo "### 📲 OTAインストールリンク" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[ここをタップしてインストール](${INSTALL_URL})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> iPhone/iPadの **Safari** で開いてください。" >> $GITHUB_STEP_SUMMARY
